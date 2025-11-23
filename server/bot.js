@@ -48,6 +48,133 @@ const JSON_LIMIT = process.env.JSON_LIMIT || '50mb';
 app.use(express.json({ limit: JSON_LIMIT }));
 app.use(express.urlencoded({ limit: JSON_LIMIT, extended: true }));
 
+// --- Background job queue for async sending ---
+const { randomUUID } = require('crypto');
+
+const jobQueue = [];
+let concurrent = 0;
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '2', 10);
+
+async function saveMediaToTempFile(input) {
+    // Returns { filePath, mime }
+    // Accepts data: URI or HTTP(S) URL
+    if (typeof input !== 'string') throw new Error('Invalid media input');
+
+    if (input.startsWith('data:')) {
+        const commaIndex = input.indexOf(',');
+        if (commaIndex === -1) throw new Error('Invalid data URI');
+        const header = input.slice(5, commaIndex);
+        const semiIndex = header.indexOf(';');
+        const mime = semiIndex === -1 ? header : header.slice(0, semiIndex);
+        const b64 = input.slice(commaIndex + 1);
+        const buffer = Buffer.from(b64, 'base64');
+        const ext = mime.split('/')[1] || 'bin';
+        const tmpName = `wwebjs_${Date.now()}_${Math.random().toString(36).slice(2,8)}.${ext}`;
+        const filePath = path.join(os.tmpdir(), tmpName);
+        await fs.promises.writeFile(filePath, buffer);
+        return { filePath, mime };
+    }
+
+    // Otherwise treat as URL and stream to temp file
+    try {
+        const url = input;
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+        const contentType = res.headers.get('content-type') || 'application/octet-stream';
+        const ext = contentType.split('/')[1] ? contentType.split('/')[1].split(';')[0] : 'bin';
+        const tmpName = `wwebjs_${Date.now()}_${Math.random().toString(36).slice(2,8)}.${ext}`;
+        const filePath = path.join(os.tmpdir(), tmpName);
+        const fileStream = fs.createWriteStream(filePath);
+        await new Promise((resolve, reject) => {
+            res.body.pipe(fileStream);
+            res.body.on('error', reject);
+            fileStream.on('finish', resolve);
+            fileStream.on('error', reject);
+        });
+        return { filePath, mime: contentType };
+    } catch (e) {
+        throw new Error(`Failed to download media: ${e.message}`);
+    }
+}
+
+async function processJob(job) {
+    const ww = require('whatsapp-web.js');
+    const MessageMedia = ww.MessageMedia;
+    const { groupId, message, imageUrls, id } = job;
+    console.log(`Processing job ${id}: group=${groupId} images=${imageUrls ? imageUrls.length : 0}`);
+    const tmpFiles = [];
+    try {
+        const filePaths = [];
+        for (const src of (imageUrls || [])) {
+            try {
+                const { filePath } = await saveMediaToTempFile(src);
+                filePaths.push(filePath);
+                tmpFiles.push(filePath);
+            } catch (e) {
+                console.warn('Failed to prepare media for job', id, e.message || e);
+            }
+        }
+
+        if (filePaths.length === 0) {
+            // fallback to text-only
+            await client.sendMessage(groupId, message);
+            console.log(`Job ${id}: sent text-only (no media)`);
+            return;
+        }
+
+        // Send first file with caption, then others
+        try {
+            const firstPath = filePaths[0];
+            let media;
+            if (typeof MessageMedia.fromFilePath === 'function') {
+                media = MessageMedia.fromFilePath(firstPath);
+            } else {
+                // fallback: read file and build MessageMedia
+                const buffer = await fs.promises.readFile(firstPath);
+                const mime = 'image/jpeg';
+                media = new MessageMedia(mime, buffer.toString('base64'));
+            }
+            await client.sendMessage(groupId, media, { caption: message });
+            for (let i = 1; i < filePaths.length; i++) {
+                const p = filePaths[i];
+                let m;
+                if (typeof MessageMedia.fromFilePath === 'function') m = MessageMedia.fromFilePath(p);
+                else {
+                    const buffer = await fs.promises.readFile(p);
+                    m = new MessageMedia('image/jpeg', buffer.toString('base64'));
+                }
+                await client.sendMessage(groupId, m);
+            }
+            console.log(`Job ${id}: sent ${filePaths.length} media messages`);
+        } catch (e) {
+            console.error('Job send failed', id, e);
+            // try fallback text
+            try { await client.sendMessage(groupId, message); } catch (e2) { console.warn('Fallback text send failed', e2.message || e2); }
+        }
+    } finally {
+        // cleanup temp files
+        for (const f of tmpFiles) {
+            try { await fs.promises.unlink(f); } catch (e) {}
+        }
+    }
+}
+
+async function processQueue() {
+    if (concurrent >= MAX_CONCURRENT) return;
+    if (jobQueue.length === 0) return;
+    concurrent++;
+    const job = jobQueue.shift();
+    try {
+        await processJob(job);
+    } catch (e) {
+        console.error('Error processing job', job.id, e.message || e);
+    } finally {
+        concurrent--;
+        // schedule next
+        setImmediate(processQueue);
+    }
+}
+
 const PORT = process.env.PORT || 3001;
 
 // Initialize WhatsApp Client
@@ -326,108 +453,15 @@ app.post('/send-update', async (req, res) => {
     }
 
     try {
-        // Send Text
-        // If there are images, try to send them with the message as caption on the first
-        // image. Otherwise just send the text message.
-
-        // Helper: convert a single URL or data URI to a MessageMedia instance
-        async function urlOrDataToMessageMedia(input) {
-            const ww = require('whatsapp-web.js');
-            // If it's a data URI (base64)
-            if (typeof input === 'string' && input.startsWith('data:')) {
-                // data:[<mediatype>][;base64],<data>
-                // Use indexOf/substring/slice rather than a large-regex capture to avoid
-                // creating huge intermediate strings when payloads are large.
-                const commaIndex = input.indexOf(',');
-                if (commaIndex === -1) throw new Error('Invalid data URI');
-
-                // header is the part between 'data:' and the comma (e.g. 'image/png;base64')
-                const header = input.slice(5, commaIndex);
-                const semiIndex = header.indexOf(';');
-                const mime = semiIndex === -1 ? header : header.slice(0, semiIndex);
-
-                // base64 part: slice from the comma+1 to the end. Using slice avoids
-                // split/regex and is a lower-overhead operation.
-                const b64 = input.slice(commaIndex + 1);
-                return new ww.MessageMedia(mime, b64);
-            }
-
-            // Otherwise treat it as a remote URL
-            try {
-                const resp = await fetch(input);
-                if (!resp.ok) throw new Error(`Failed to fetch ${input}: ${resp.status}`);
-                const contentType = resp.headers.get('content-type') || 'application/octet-stream';
-                const ab = await resp.arrayBuffer();
-                const buffer = Buffer.from(ab);
-                const b64 = buffer.toString('base64');
-                return new ww.MessageMedia(contentType, b64);
-            } catch (err) {
-                throw new Error(`Failed to load image ${input}: ${err.message}`);
-            }
-        }
-
-        // If there are images, convert and send them
-        if (imageUrls && imageUrls.length > 0) {
-            // Prepare MessageMedia objects
-            const medias = [];
-            const errors = [];
-            console.log(`Preparing to send ${imageUrls.length} images to ${groupId}`);
-            for (const url of imageUrls) {
-                try {
-                    console.log('Loading image:', url && (url.length > 120 ? url.slice(0,120)+'...' : url));
-                    const media = await urlOrDataToMessageMedia(url);
-                    // Basic sanity: ensure media has data
-                    if (!media || !media.data) {
-                        throw new Error('Empty media data');
-                    }
-                    medias.push(media);
-                    console.log('Image prepared (size approx):', media.data.length ? `${Math.ceil(media.data.length/1024)} KB` : 'unknown');
-                } catch (e) {
-                    console.warn('Image skipped:', e.message);
-                    errors.push({ url, error: e.message });
-                }
-            }
-
-            let sentCount = 0;
-            if (medias.length === 0) {
-                // No images could be prepared, fallback to text
-                console.log('No valid images prepared; sending text only');
-                await client.sendMessage(groupId, message);
-            } else {
-                // Send first media with caption (message), then remaining medias without caption
-                try {
-                    console.log('Sending first image with caption');
-                    const m0 = await client.sendMessage(groupId, medias[0], { caption: message });
-                    sentCount++;
-                    for (let i = 1; i < medias.length; i++) {
-                        // small delay to avoid rate issues
-                        await new Promise(r => setTimeout(r, 250));
-                        try {
-                            await client.sendMessage(groupId, medias[i]);
-                            sentCount++;
-                        } catch (e) {
-                            console.error('Failed to send media index', i, e.message || e);
-                            errors.push({ index: i, error: e.message || String(e) });
-                        }
-                    }
-                } catch (e) {
-                    console.error('Failed to send media messages:', e);
-                    errors.push({ sendError: e.message || String(e) });
-                    // fallback: try to send text only
-                    try { await client.sendMessage(groupId, message); } catch (e2) { console.warn('Fallback text send failed', e2.message || e2); }
-                }
-            }
-
-            return res.json({ success: true, sentImages: sentCount, prepared: medias.length, errors });
-        } else {
-            const info = await client.sendMessage(groupId, message);
-            return res.json({ success: true, messageId: info && info.id ? info.id._serialized || info.id : null });
-        }
-
-        res.json({ success: true });
+        // Enqueue job and return quickly so frontend isn't blocked by sending time
+        const jobId = randomUUID();
+        jobQueue.push({ id: jobId, groupId, message, imageUrls });
+        // kick the worker
+        setImmediate(processQueue);
+        return res.status(202).json({ accepted: true, jobId });
     } catch (error) {
-        console.error('Send failed:', error);
-        res.status(500).json({ error: 'Failed to send message' });
+        console.error('Enqueue failed:', error);
+        res.status(500).json({ error: 'Failed to enqueue message' });
     }
 });
 
