@@ -43,7 +43,10 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Increase body parsing limits to support large data-URI payloads (collages)
+const JSON_LIMIT = process.env.JSON_LIMIT || '50mb';
+app.use(express.json({ limit: JSON_LIMIT }));
+app.use(express.urlencoded({ limit: JSON_LIMIT, extended: true }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -316,6 +319,7 @@ app.post('/send-update', async (req, res) => {
     if (!isReady) return res.status(503).json({ error: 'WhatsApp not connected' });
 
     const { groupId, message, imageUrls } = req.body;
+    console.log('/send-update received: groupId=', (groupId||'').toString().slice(0,60), 'messageLen=', (message||'').length, 'imageUrlsCount=', Array.isArray(imageUrls) ? imageUrls.length : 0, 'content-length=', req.headers['content-length']);
 
     if (!groupId || !message) {
         return res.status(400).json({ error: 'Missing groupId or message' });
