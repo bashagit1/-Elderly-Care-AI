@@ -332,10 +332,19 @@ app.post('/send-update', async (req, res) => {
             // If it's a data URI (base64)
             if (typeof input === 'string' && input.startsWith('data:')) {
                 // data:[<mediatype>][;base64],<data>
-                const match = input.match(/^data:([^;]+);base64,(.*)$/s);
-                if (!match) throw new Error('Invalid data URI');
-                const mime = match[1];
-                const b64 = match[2];
+                // Use indexOf/substring/slice rather than a large-regex capture to avoid
+                // creating huge intermediate strings when payloads are large.
+                const commaIndex = input.indexOf(',');
+                if (commaIndex === -1) throw new Error('Invalid data URI');
+
+                // header is the part between 'data:' and the comma (e.g. 'image/png;base64')
+                const header = input.slice(5, commaIndex);
+                const semiIndex = header.indexOf(';');
+                const mime = semiIndex === -1 ? header : header.slice(0, semiIndex);
+
+                // base64 part: slice from the comma+1 to the end. Using slice avoids
+                // split/regex and is a lower-overhead operation.
+                const b64 = input.slice(commaIndex + 1);
                 return new ww.MessageMedia(mime, b64);
             }
 
