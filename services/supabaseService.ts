@@ -6,7 +6,10 @@ import { BotStatusResponse } from './database';
 // CONFIGURATION
 const SUPABASE_URL = 'https://zaiektkvhjfndfebolao.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InphaWVrdGt2aGpmbmRmZWJvbGFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM3OTM3NTEsImV4cCI6MjA3OTM2OTc1MX0.34BB18goOvIpwPci2u25JLoC7l9PRfanpC9C4DS4RfQ';
-const BOT_SERVER_URL = 'http://localhost:3001'; // Address where server/bot.js is running locally
+// Address where server/bot.js is running. In production, set `VITE_BOT_SERVER_URL`
+// as an environment variable in your frontend host (Netlify/Vercel) so the UI
+// calls the correct backend. Falls back to localhost for local development.
+const BOT_SERVER_URL = (import.meta.env.VITE_BOT_SERVER_URL as string) || 'http://localhost:3001'; // Address where server/bot.js is running locally
 
 // Initialize Client
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);

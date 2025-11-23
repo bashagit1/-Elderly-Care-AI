@@ -323,13 +323,92 @@ app.post('/send-update', async (req, res) => {
 
     try {
         // Send Text
-        await client.sendMessage(groupId, message);
+        // If there are images, try to send them with the message as caption on the first
+        // image. Otherwise just send the text message.
 
-        // Send Images (if any)
+        // Helper: convert a single URL or data URI to a MessageMedia instance
+        async function urlOrDataToMessageMedia(input) {
+            const ww = require('whatsapp-web.js');
+            // If it's a data URI (base64)
+            if (typeof input === 'string' && input.startsWith('data:')) {
+                // data:[<mediatype>][;base64],<data>
+                const match = input.match(/^data:([^;]+);base64,(.*)$/s);
+                if (!match) throw new Error('Invalid data URI');
+                const mime = match[1];
+                const b64 = match[2];
+                return new ww.MessageMedia(mime, b64);
+            }
+
+            // Otherwise treat it as a remote URL
+            try {
+                const resp = await fetch(input);
+                if (!resp.ok) throw new Error(`Failed to fetch ${input}: ${resp.status}`);
+                const contentType = resp.headers.get('content-type') || 'application/octet-stream';
+                const ab = await resp.arrayBuffer();
+                const buffer = Buffer.from(ab);
+                const b64 = buffer.toString('base64');
+                return new ww.MessageMedia(contentType, b64);
+            } catch (err) {
+                throw new Error(`Failed to load image ${input}: ${err.message}`);
+            }
+        }
+
+        // If there are images, convert and send them
         if (imageUrls && imageUrls.length > 0) {
-             // Note: For full image support, we need to download the base64/url and convert 
-             // to MessageMedia. Keeping it simple for V1.
-             console.log(`(Server) Would send images: ${imageUrls.length}`);
+            // Prepare MessageMedia objects
+            const medias = [];
+            const errors = [];
+            console.log(`Preparing to send ${imageUrls.length} images to ${groupId}`);
+            for (const url of imageUrls) {
+                try {
+                    console.log('Loading image:', url && (url.length > 120 ? url.slice(0,120)+'...' : url));
+                    const media = await urlOrDataToMessageMedia(url);
+                    // Basic sanity: ensure media has data
+                    if (!media || !media.data) {
+                        throw new Error('Empty media data');
+                    }
+                    medias.push(media);
+                    console.log('Image prepared (size approx):', media.data.length ? `${Math.ceil(media.data.length/1024)} KB` : 'unknown');
+                } catch (e) {
+                    console.warn('Image skipped:', e.message);
+                    errors.push({ url, error: e.message });
+                }
+            }
+
+            let sentCount = 0;
+            if (medias.length === 0) {
+                // No images could be prepared, fallback to text
+                console.log('No valid images prepared; sending text only');
+                await client.sendMessage(groupId, message);
+            } else {
+                // Send first media with caption (message), then remaining medias without caption
+                try {
+                    console.log('Sending first image with caption');
+                    const m0 = await client.sendMessage(groupId, medias[0], { caption: message });
+                    sentCount++;
+                    for (let i = 1; i < medias.length; i++) {
+                        // small delay to avoid rate issues
+                        await new Promise(r => setTimeout(r, 250));
+                        try {
+                            await client.sendMessage(groupId, medias[i]);
+                            sentCount++;
+                        } catch (e) {
+                            console.error('Failed to send media index', i, e.message || e);
+                            errors.push({ index: i, error: e.message || String(e) });
+                        }
+                    }
+                } catch (e) {
+                    console.error('Failed to send media messages:', e);
+                    errors.push({ sendError: e.message || String(e) });
+                    // fallback: try to send text only
+                    try { await client.sendMessage(groupId, message); } catch (e2) { console.warn('Fallback text send failed', e2.message || e2); }
+                }
+            }
+
+            return res.json({ success: true, sentImages: sentCount, prepared: medias.length, errors });
+        } else {
+            const info = await client.sendMessage(groupId, message);
+            return res.json({ success: true, messageId: info && info.id ? info.id._serialized || info.id : null });
         }
 
         res.json({ success: true });
