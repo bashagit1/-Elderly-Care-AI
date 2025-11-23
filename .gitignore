@@ -33,3 +33,5 @@ npm-debug.log
 yarn-error.log
 build
 /.cache
+tmp_qr.png
+tmp_qr.svg

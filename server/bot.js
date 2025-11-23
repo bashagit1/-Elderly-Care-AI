@@ -198,23 +198,29 @@ client.on('disconnected', (reason) => {
     })();
 });
 
-client.initialize();
-
-// Try to restore session from Supabase before or right after initialization
-if (supabase) {
-    (async () => {
+// Attempt to restore session from Supabase BEFORE initializing the client when possible
+async function tryRestoreAndInit() {
+    if (supabase) {
         try {
             const restored = await downloadSessionFromSupabase(DATA_PATH);
             if (restored) {
-                console.log('Restored session from Supabase — re-initializing client');
-                try { await client.destroy(); } catch {}
-                client.initialize();
+                console.log('Restored session from Supabase — initializing client with restored session');
+            } else {
+                console.log('No session restored from Supabase (starting fresh)');
             }
         } catch (e) {
             console.warn('Session restore attempt failed:', e);
         }
-    })();
+    }
+
+    try {
+        client.initialize();
+    } catch (e) {
+        console.error('Failed to initialize WhatsApp client:', e);
+    }
 }
+
+tryRestoreAndInit();
 
 // --- API ENDPOINTS ---
 
@@ -248,6 +254,43 @@ app.get('/qr/png', async (req, res) => {
     } catch (e) {
         res.status(500).send('QR generation error');
     }
+});
+
+// Return QR as SVG (scalable, often smaller for browser scanning)
+app.get('/qr/svg', async (req, res) => {
+    if (!currentQR) return res.status(404).send('No QR available');
+    try {
+        const qrcode = require('qrcode');
+        const svg = await qrcode.toString(currentQR, { type: 'svg', margin: 1 });
+        res.type('image/svg+xml').send(svg);
+    } catch (e) {
+        console.warn('Failed to generate QR SVG:', e);
+        res.status(500).send('QR SVG generation error');
+    }
+});
+
+// Simple HTML page to view and scan QR (scaled for easier scanning on Railway UI)
+app.get('/qr/page', (req, res) => {
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WhatsApp Bot — QR</title>
+  <style>body{display:flex;height:100vh;align-items:center;justify-content:center;font-family:Arial,Helvetica,sans-serif} .card{max-width:420px;padding:16px;border:1px solid #eaeaea;border-radius:8px;text-align:center} img{width:320px;max-width:100%} pre{white-space:pre-wrap;word-break:break-word;text-align:left;}</style>
+</head>
+<body>
+  <div class="card">
+    <h3>Scan WhatsApp QR</h3>
+    <p>If the image looks too large or small, try the SVG version or download and scan.</p>
+    <img src="/qr/png" alt="WhatsApp QR" />
+    <div style="margin-top:12px">
+      <a href="/qr/svg" target="_blank">Open SVG (scalable)</a> · <a href="/qr/png" download="qr.png">Download PNG</a>
+    </div>
+    <p style="font-size:12px;margin-top:8px;color:#666">Once authenticated the bot will report 'status: connected' at <code>/status</code>.</p>
+  </div>
+</body>
+</html>`;
+    res.type('text/html').send(html);
 });
 
 // 3. Get All Groups (For Admin Discovery)
