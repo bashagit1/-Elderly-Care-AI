@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Elderly Care AI",
+  "description": "A comprehensive dashboard for elderly care homes to manage resident updates and automate family communication via WhatsApp.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
