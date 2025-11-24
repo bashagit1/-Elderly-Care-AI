@@ -216,14 +216,22 @@ app.post('/send-update', async (req, res) => {
                     }
                     
                     if (media) {
-                        await client.sendMessage(groupId, media);
+                        // Wrap sendMessage in a Promise race to implement timeout
+                        // If sending one image takes > 10 seconds, we skip it to prevent timeout/hanging
+                        const sendPromise = client.sendMessage(groupId, media);
+                        const timeoutPromise = new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('Timeout sending image')), 10000)
+                        );
+                        
+                        await Promise.race([sendPromise, timeoutPromise]);
                         console.log(`Sent image ${i + 1}.`);
                     }
                 } catch (imgErr) {
-                    console.error('Failed to process/send an image:', imgErr.message);
+                    console.error(`Failed to process/send image ${i+1}:`, imgErr.message);
+                    // Continue loop even if one image fails
                 }
                 
-                // Reduced delay to 500ms for faster burst
+                // Small delay between images
                 await new Promise(r => setTimeout(r, 500));
             }
         }
