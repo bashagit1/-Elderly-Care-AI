@@ -221,8 +221,8 @@ app.post('/send-update', async (req, res) => {
                     console.error('Failed to process/send an image:', imgErr.message);
                 }
                 
-                // Delay between images to ensure order
-                await new Promise(r => setTimeout(r, 1500));
+                // Reduced delay to 500ms for faster burst
+                await new Promise(r => setTimeout(r, 500));
             }
         }
 
