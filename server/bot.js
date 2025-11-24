@@ -128,9 +128,10 @@ app.get('/qr', (req, res) => {
 
 // 3. Get All Groups (For Admin Discovery)
 app.get('/groups', async (req, res) => {
+    // Return empty array instead of 503 to allow frontend dropdown to render properly (just empty)
     if (!isReady) {
-        console.warn('GET /groups failed: Client not ready');
-        return res.status(503).json({ error: 'WhatsApp not connected' });
+        console.warn('GET /groups: Client not ready, returning empty list');
+        return res.json([]); 
     }
     
     try {
@@ -164,7 +165,8 @@ app.get('/groups', async (req, res) => {
         res.json(groups);
     } catch (error) {
         console.error('Error fetching groups:', error);
-        res.status(500).json({ error: error.message });
+        // Return empty array on error to prevent frontend crash
+        res.json([]);
     }
 });
 
