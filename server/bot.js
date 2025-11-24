@@ -36,8 +36,9 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-// Increase limit for base64 images
+// Increase limit for base64 images to avoid PayloadTooLargeError
 app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -114,8 +115,6 @@ app.get('/', (req, res) => {
 
 // 1. Check Status & Get QR info
 app.get('/status', (req, res) => {
-    // Log less frequently to avoid spam
-    // console.log(`[${new Date().toISOString()}] Status check received. Ready: ${isReady}`);
     res.json({ 
         status: isReady ? 'connected' : 'disconnected',
         hasQR: !!currentQR
@@ -136,23 +135,32 @@ app.get('/groups', async (req, res) => {
     
     try {
         console.log('Fetching chats...');
-        const chats = await client.getChats();
-        console.log(`Found ${chats.length} total chats.`);
         
-        // Filter for groups: either isGroup property OR id ends with @g.us
-        const groups = chats
-            .filter(chat => chat.isGroup || chat.id._serialized.endsWith('@g.us'))
-            .map(chat => ({
-                id: chat.id._serialized,
-                name: chat.name || 'Unknown Group'
-            }));
+        let attempts = 0;
+        let groups = [];
+        
+        // Retry logic: WhatsApp Web sometimes takes a moment to sync chats after 'ready'
+        while (attempts < 3 && groups.length === 0) {
+            const chats = await client.getChats();
             
-        console.log(`Filtered to ${groups.length} groups.`);
-        
-        if (groups.length === 0) {
-            console.log("No groups found. This might be because the chat history hasn't synced yet.");
+            // Filter for groups: either isGroup property OR id ends with @g.us
+            groups = chats
+                .filter(chat => chat.isGroup || chat.id._serialized.endsWith('@g.us'))
+                .map(chat => ({
+                    id: chat.id._serialized,
+                    name: chat.name || 'Unknown Group'
+                }));
+
+            if (groups.length === 0) {
+                console.log(`Attempt ${attempts + 1}: No groups found. Retrying in 2s...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                attempts++;
+            } else {
+                break; // Found groups, exit loop
+            }
         }
-        
+
+        console.log(`Found ${groups.length} groups.`);
         res.json(groups);
     } catch (error) {
         console.error('Error fetching groups:', error);
@@ -169,31 +177,37 @@ app.post('/send-update', async (req, res) => {
 
     const { groupId, message, imageUrls } = req.body;
 
-    if (!groupId || !message) {
-        return res.status(400).json({ error: 'Missing groupId or message' });
+    if (!groupId) {
+        return res.status(400).json({ error: 'Missing groupId' });
+    }
+
+    // Relaxed Validation: Allow empty message IF there are images
+    if ((!message || message.trim() === '') && (!imageUrls || imageUrls.length === 0)) {
+        return res.status(400).json({ error: 'At least a message or an image is required' });
     }
 
     console.log(`Processing update for group: ${groupId}`);
+    const hasImages = imageUrls && imageUrls.length > 0;
+    const hasText = message && message.trim().length > 0;
 
     try {
-        // 1. Send Text
-        await client.sendMessage(groupId, message);
-        console.log('Text message sent.');
+        // 1. Send Images (if any)
+        if (hasImages) {
+            console.log(`Sending ${imageUrls.length} images...`);
+            
+            // Loop through images
+            for (let i = 0; i < imageUrls.length; i++) {
+                const url = imageUrls[i];
+                let media;
 
-        // 2. Send Images
-        if (imageUrls && imageUrls.length > 0) {
-             console.log(`Processing ${imageUrls.length} images...`);
-             
-             // Send sequentially to ensure order
-             for (const url of imageUrls) {
                 try {
-                    let media;
                     // Handle Base64 Data URI
                     if (url.startsWith('data:')) {
                         const parts = url.split(',');
                         const mime = parts[0].match(/:(.*?);/)[1];
                         const data = parts[1];
-                        media = new MessageMedia(mime, data, 'update.jpg');
+                        // Generate a filename based on timestamp
+                        media = new MessageMedia(mime, data, `update_${Date.now()}_${i}.jpg`);
                     } else {
                         // Handle Remote URL
                         media = await MessageMedia.fromUrl(url);
@@ -201,22 +215,27 @@ app.post('/send-update', async (req, res) => {
                     
                     if (media) {
                         await client.sendMessage(groupId, media);
-                        console.log('Image sent successfully.');
+                        console.log(`Sent image ${i + 1}.`);
                     }
                 } catch (imgErr) {
                     console.error('Failed to process/send an image:', imgErr.message);
                 }
                 
-                // Small delay between images to prevent rate limiting issues
-                await new Promise(r => setTimeout(r, 500));
-             }
+                // Delay between images to ensure order
+                await new Promise(r => setTimeout(r, 1500));
+            }
+        }
+
+        // 2. Send Text Message (if any)
+        if (hasText) {
+            await client.sendMessage(groupId, message);
+            console.log('Text message sent.');
         }
 
         res.json({ success: true });
     } catch (error) {
         console.error('Send failed:', error);
-        // If it's an invalid ID error, tell the user
-        if (error.message.includes('invalid Wid')) {
+        if (error.message && error.message.includes('invalid Wid')) {
             return res.status(400).json({ error: 'Invalid Group ID. Please scan groups again.' });
         }
         res.status(500).json({ error: 'Failed to send message: ' + error.message });
