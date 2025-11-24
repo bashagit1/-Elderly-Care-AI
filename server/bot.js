@@ -42,6 +42,13 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 3001;
 
+// --- HEARTBEAT LOGGING ---
+// Keep the logs active and monitor memory usage every 5 minutes
+setInterval(() => {
+    const memUsage = process.memoryUsage();
+    console.log(`[HEARTBEAT] Server active. RAM Used: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
+}, 300000);
+
 // Initialize WhatsApp Client
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -90,10 +97,14 @@ client.on('auth_failure', (msg) => {
 });
 
 client.on('disconnected', (reason) => {
-    console.log('⚠️ Client was logged out', reason);
+    console.log('⚠️ Client was logged out:', reason);
     isReady = false;
-    // Re-initialize to allow re-scanning
-    client.initialize();
+    
+    // CRITICAL FIX: FORCE RESTART
+    // Instead of trying to re-init (which often leaves zombie chrome processes),
+    // we kill the process. Railway/Docker will automatically restart it fresh.
+    console.log('RESTARTING SERVER TO REFRESH SESSION...');
+    process.exit(1); 
 });
 
 // Initialize client
@@ -200,7 +211,7 @@ app.post('/send-update', async (req, res) => {
             // Loop through images
             for (let i = 0; i < imageUrls.length; i++) {
                 const url = imageUrls[i];
-                let media;
+                let media = null; // Explicit null init
 
                 try {
                     // Handle Base64 Data URI
@@ -229,10 +240,13 @@ app.post('/send-update', async (req, res) => {
                 } catch (imgErr) {
                     console.error(`Failed to process/send image ${i+1}:`, imgErr.message);
                     // Continue loop even if one image fails
+                } finally {
+                    // MEMORY CLEANUP: Critical for Railway
+                    media = null;
                 }
                 
-                // Small delay between images
-                await new Promise(r => setTimeout(r, 500));
+                // SAFETY DELAY: Increased to 1s to let CPU cool down and GC run
+                await new Promise(r => setTimeout(r, 1000));
             }
         }
 
