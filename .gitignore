@@ -26,9 +26,10 @@ dist-ssr
 # Project-specific
 .env
 .env.*
-wwebjs_auth/
-wwebjs_auth/session 
-wwebjs_auth\
+.wwebjs_auth/
+.wwebjs_auth/session 
+.wwebjs_auth\session
+.wwebjs_auth\
 *.tar.gz
 node_modules/
 npm-debug.log
