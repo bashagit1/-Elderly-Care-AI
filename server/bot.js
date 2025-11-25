@@ -43,11 +43,11 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const PORT = process.env.PORT || 3001;
 
 // --- HEARTBEAT LOGGING ---
-// Keep the logs active and monitor memory usage every 5 minutes
+// Keep the logs active and monitor memory usage every 2 minutes (120000ms) to prevent sleep
 setInterval(() => {
     const memUsage = process.memoryUsage();
     console.log(`[HEARTBEAT] Server active. RAM Used: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
-}, 300000);
+}, 120000);
 
 // Initialize WhatsApp Client
 const client = new Client({
@@ -94,6 +94,8 @@ client.on('authenticated', () => {
 client.on('auth_failure', (msg) => {
     console.error('❌ AUTHENTICATION FAILURE', msg);
     isReady = false;
+    // Force restart on auth failure to allow fresh retry
+    process.exit(1);
 });
 
 client.on('disconnected', (reason) => {
@@ -112,9 +114,11 @@ console.log('Initializing WhatsApp Client...');
 try {
     client.initialize().catch(err => {
         console.error("Client initialization failed:", err);
+        process.exit(1); // Force restart if init fails
     });
 } catch (err) {
     console.error("Synchronous client error:", err);
+    process.exit(1);
 }
 
 // --- API ENDPOINTS ---
