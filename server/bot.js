@@ -186,8 +186,8 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// 4. Send Update
-app.post('/send-update', async (req, res) => {
+// 4. Send Update (Background Processed)
+app.post('/send-update', (req, res) => {
     if (!isReady) {
         console.warn('POST /send-update failed: Client not ready');
         return res.status(503).json({ error: 'WhatsApp not connected' });
@@ -204,71 +204,77 @@ app.post('/send-update', async (req, res) => {
         return res.status(400).json({ error: 'At least a message or an image is required' });
     }
 
-    console.log(`Processing update for group: ${groupId}`);
-    const hasImages = imageUrls && imageUrls.length > 0;
-    const hasText = message && message.trim().length > 0;
+    // --- FIRE AND FORGET STRATEGY ---
+    // We reply "Success" immediately so the Frontend doesn't hang or timeout.
+    // The bot processes the images in the background.
+    res.json({ success: true, status: 'queued' });
 
-    try {
-        // 1. Send Images (if any)
-        if (hasImages) {
-            console.log(`Sending ${imageUrls.length} images...`);
-            
-            // Loop through images
-            for (let i = 0; i < imageUrls.length; i++) {
-                const url = imageUrls[i];
-                let media = null; // Explicit null init
+    // Start Background Processing
+    (async () => {
+        console.log(`[BG] Processing update for group: ${groupId}`);
+        const hasImages = imageUrls && imageUrls.length > 0;
+        const hasText = message && message.trim().length > 0;
 
-                try {
-                    // Handle Base64 Data URI
-                    if (url.startsWith('data:')) {
-                        const parts = url.split(',');
-                        const mime = parts[0].match(/:(.*?);/)[1];
-                        const data = parts[1];
-                        // Generate a filename based on timestamp
-                        media = new MessageMedia(mime, data, `update_${Date.now()}_${i}.jpg`);
-                    } else {
-                        // Handle Remote URL
-                        media = await MessageMedia.fromUrl(url);
+        try {
+            // 1. Send Images (if any)
+            if (hasImages) {
+                console.log(`[BG] Queued ${imageUrls.length} images...`);
+                
+                // Loop through images
+                for (let i = 0; i < imageUrls.length; i++) {
+                    const url = imageUrls[i];
+                    let media = null; 
+
+                    try {
+                        // Handle Base64 Data URI
+                        if (url.startsWith('data:')) {
+                            const parts = url.split(',');
+                            const mimeMatch = parts[0].match(/:(.*?);/);
+                            const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg'; // Fallback MIME
+                            const data = parts[1];
+                            
+                            // Generate a filename based on timestamp
+                            media = new MessageMedia(mime, data, `update_${Date.now()}_${i}.jpg`);
+                        } else {
+                            // Handle Remote URL
+                            media = await MessageMedia.fromUrl(url);
+                        }
+                        
+                        if (media) {
+                            // Wrap sendMessage in a Promise race to implement timeout
+                            // If sending one image takes > 15 seconds, we skip it
+                            const sendPromise = client.sendMessage(groupId, media);
+                            const timeoutPromise = new Promise((_, reject) => 
+                                setTimeout(() => reject(new Error('Timeout sending image')), 15000)
+                            );
+                            
+                            await Promise.race([sendPromise, timeoutPromise]);
+                            console.log(`[BG] Sent image ${i + 1}/${imageUrls.length}`);
+                        }
+                    } catch (imgErr) {
+                        console.error(`[BG] Failed to process/send image ${i+1}:`, imgErr.message);
+                    } finally {
+                        // MEMORY CLEANUP
+                        media = null;
                     }
                     
-                    if (media) {
-                        // Wrap sendMessage in a Promise race to implement timeout
-                        // If sending one image takes > 10 seconds, we skip it to prevent timeout/hanging
-                        const sendPromise = client.sendMessage(groupId, media);
-                        const timeoutPromise = new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('Timeout sending image')), 10000)
-                        );
-                        
-                        await Promise.race([sendPromise, timeoutPromise]);
-                        console.log(`Sent image ${i + 1}.`);
-                    }
-                } catch (imgErr) {
-                    console.error(`Failed to process/send image ${i+1}:`, imgErr.message);
-                    // Continue loop even if one image fails
-                } finally {
-                    // MEMORY CLEANUP: Critical for Railway
-                    media = null;
+                    // SAFETY DELAY: 1s between images to prevent flood limits
+                    await new Promise(r => setTimeout(r, 1000));
                 }
-                
-                // SAFETY DELAY: Increased to 1s to let CPU cool down and GC run
-                await new Promise(r => setTimeout(r, 1000));
             }
-        }
 
-        // 2. Send Text Message (if any)
-        if (hasText) {
-            await client.sendMessage(groupId, message);
-            console.log('Text message sent.');
-        }
+            // 2. Send Text Message (if any)
+            if (hasText) {
+                await client.sendMessage(groupId, message);
+                console.log('[BG] Text message sent.');
+            }
 
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Send failed:', error);
-        if (error.message && error.message.includes('invalid Wid')) {
-            return res.status(400).json({ error: 'Invalid Group ID. Please scan groups again.' });
+            console.log('[BG] Batch completed successfully.');
+
+        } catch (error) {
+            console.error('[BG] Critical Background Error:', error);
         }
-        res.status(500).json({ error: 'Failed to send message: ' + error.message });
-    }
+    })();
 });
 
 app.listen(PORT, () => {
