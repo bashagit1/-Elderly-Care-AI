@@ -125,7 +125,8 @@ try {
 
 // 0. Root Health Check
 app.get('/', (req, res) => {
-    res.send('Elderly Care Watch AI Bot Server is Running!');
+    const uptime = process.uptime();
+    res.send(`Elderly Care Watch AI Bot Server is Running! Uptime: ${Math.floor(uptime)}s`);
 });
 
 // 1. Check Status & Get QR info
