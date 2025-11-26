@@ -35,7 +35,14 @@ try {
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+// Robust CORS to allow Netlify frontend
+app.use(cors({
+    origin: '*', // Allow all origins for simplicity in this setup
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type']
+}));
+
 // Increase limit for base64 images to avoid PayloadTooLargeError
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
@@ -47,16 +54,29 @@ let isReady = false;
 let currentQR = null;
 
 // The Queue ensures we process one batch of updates at a time.
-// This prevents the "Zombie Browser" issue where multiple requests choke Puppeteer.
 const jobQueue = [];
 let isProcessingQueue = false;
+let lastJobStartTime = 0; // Timestamp to track stuck jobs
 
-// --- HEARTBEAT & SELF-HEALING ---
-// Monitor not just RAM, but Client State.
+// --- HEARTBEAT & SELF-HEALING (WATCHDOG) ---
+// Monitor not just RAM, but Client State and STUCK QUEUES.
 setInterval(async () => {
     const memUsage = process.memoryUsage();
     const ram = Math.round(memUsage.heapUsed / 1024 / 1024);
-    console.log(`[HEARTBEAT] Server Uptime: ${Math.floor(process.uptime())}s | RAM: ${ram}MB | Queue: ${jobQueue.length}`);
+    const uptime = Math.floor(process.uptime());
+    
+    console.log(`[HEARTBEAT] Uptime: ${uptime}s | RAM: ${ram}MB | Queue: ${jobQueue.length} | Ready: ${isReady}`);
+
+    // WATCHDOG: Check for STUCK JOBS
+    // If we are "processing" a job for more than 2 minutes (120000ms), the browser is frozen.
+    if (isProcessingQueue && lastJobStartTime > 0) {
+        const duration = Date.now() - lastJobStartTime;
+        if (duration > 120000) { 
+            console.error(`[WATCHDOG] 🚨 CRITICAL: Job stuck for ${Math.round(duration/1000)}s. Browser likely frozen.`);
+            console.error('[WATCHDOG] Force restarting server to clear fault...');
+            process.exit(1); // Railway will restart the container fresh
+        }
+    }
 
     // Active Health Check
     if (isReady) {
@@ -140,6 +160,8 @@ async function processQueue() {
     if (isProcessingQueue || jobQueue.length === 0) return;
 
     isProcessingQueue = true;
+    lastJobStartTime = Date.now(); // Mark start time for Watchdog
+    
     const job = jobQueue.shift(); // Get the oldest job
 
     console.log(`[QUEUE] Processing job for Group ${job.groupId} (${job.imageUrls?.length || 0} images)`);
@@ -150,6 +172,7 @@ async function processQueue() {
         console.error(`[QUEUE] Job Failed:`, err);
     } finally {
         isProcessingQueue = false;
+        lastJobStartTime = 0; // Reset watchdog timer
         // Wait a small bit before next job to let CPU cool down
         setTimeout(processQueue, 1000); 
     }
