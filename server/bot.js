@@ -42,12 +42,37 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 3001;
 
-// --- HEARTBEAT LOGGING ---
-// Keep the logs active and monitor memory usage every 2 minutes (120000ms) to prevent sleep
-setInterval(() => {
+// --- GLOBAL STATE & QUEUE ---
+let isReady = false;
+let currentQR = null;
+
+// The Queue ensures we process one batch of updates at a time.
+// This prevents the "Zombie Browser" issue where multiple requests choke Puppeteer.
+const jobQueue = [];
+let isProcessingQueue = false;
+
+// --- HEARTBEAT & SELF-HEALING ---
+// Monitor not just RAM, but Client State.
+setInterval(async () => {
     const memUsage = process.memoryUsage();
-    console.log(`[HEARTBEAT] Server active. RAM Used: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`);
-}, 120000);
+    const ram = Math.round(memUsage.heapUsed / 1024 / 1024);
+    console.log(`[HEARTBEAT] Server Uptime: ${Math.floor(process.uptime())}s | RAM: ${ram}MB | Queue: ${jobQueue.length}`);
+
+    // Active Health Check
+    if (isReady) {
+        try {
+            // Ask puppeteer for the state. If this hangs/fails, the browser is dead.
+            const state = await client.getState();
+            if (!state) {
+                console.error('[HEARTBEAT] Client state is null. Restarting...');
+                process.exit(1);
+            }
+        } catch (e) {
+            console.error('[HEARTBEAT] Client unresponsive. Force Restarting...', e.message);
+            process.exit(1);
+        }
+    }
+}, 60000); // Check every 60 seconds
 
 // Initialize WhatsApp Client
 const client = new Client({
@@ -56,7 +81,7 @@ const client = new Client({
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
+            '--disable-dev-shm-usage', // Critical for Docker/Railway
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
@@ -66,23 +91,17 @@ const client = new Client({
     }
 });
 
-// State
-let isReady = false;
-let currentQR = null;
-
 client.on('qr', (qr) => {
-    // Update current QR
     currentQR = qr;
     isReady = false;
     console.log('QR RECEIVED. Scan this to login.');
-    // Print QR to terminal for debugging if local
     qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', () => {
     console.log('✅ Client is ready!');
     isReady = true;
-    currentQR = null; // Clear QR when connected
+    currentQR = null;
 });
 
 client.on('authenticated', () => {
@@ -94,17 +113,12 @@ client.on('authenticated', () => {
 client.on('auth_failure', (msg) => {
     console.error('❌ AUTHENTICATION FAILURE', msg);
     isReady = false;
-    // Force restart on auth failure to allow fresh retry
     process.exit(1);
 });
 
 client.on('disconnected', (reason) => {
     console.log('⚠️ Client was logged out:', reason);
     isReady = false;
-    
-    // CRITICAL FIX: FORCE RESTART
-    // Instead of trying to re-init (which often leaves zombie chrome processes),
-    // we kill the process. Railway/Docker will automatically restart it fresh.
     console.log('RESTARTING SERVER TO REFRESH SESSION...');
     process.exit(1); 
 });
@@ -114,22 +128,95 @@ console.log('Initializing WhatsApp Client...');
 try {
     client.initialize().catch(err => {
         console.error("Client initialization failed:", err);
-        process.exit(1); // Force restart if init fails
+        process.exit(1);
     });
 } catch (err) {
     console.error("Synchronous client error:", err);
     process.exit(1);
 }
 
+// --- QUEUE PROCESSOR ---
+async function processQueue() {
+    if (isProcessingQueue || jobQueue.length === 0) return;
+
+    isProcessingQueue = true;
+    const job = jobQueue.shift(); // Get the oldest job
+
+    console.log(`[QUEUE] Processing job for Group ${job.groupId} (${job.imageUrls?.length || 0} images)`);
+
+    try {
+        await processJob(job);
+    } catch (err) {
+        console.error(`[QUEUE] Job Failed:`, err);
+    } finally {
+        isProcessingQueue = false;
+        // Wait a small bit before next job to let CPU cool down
+        setTimeout(processQueue, 1000); 
+    }
+}
+
+async function processJob(job) {
+    const { groupId, message, imageUrls } = job;
+    const hasImages = imageUrls && imageUrls.length > 0;
+    const hasText = message && message.trim().length > 0;
+
+    // 1. Send Images
+    if (hasImages) {
+        for (let i = 0; i < imageUrls.length; i++) {
+            const url = imageUrls[i];
+            let media = null; 
+
+            try {
+                if (url.startsWith('data:')) {
+                    const parts = url.split(',');
+                    const mimeMatch = parts[0].match(/:(.*?);/);
+                    const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+                    const data = parts[1];
+                    media = new MessageMedia(mime, data, `update_${Date.now()}_${i}.jpg`);
+                } else {
+                    media = await MessageMedia.fromUrl(url);
+                }
+                
+                if (media) {
+                    const sendPromise = client.sendMessage(groupId, media);
+                    // 20s Timeout per image (increased for safety)
+                    const timeoutPromise = new Promise((_, reject) => 
+                        setTimeout(() => reject(new Error('Timeout sending image')), 20000)
+                    );
+                    
+                    await Promise.race([sendPromise, timeoutPromise]);
+                    console.log(`[QUEUE] Sent image ${i + 1}/${imageUrls.length}`);
+                }
+            } catch (imgErr) {
+                console.error(`[QUEUE] Error sending image ${i+1}:`, imgErr.message);
+            } finally {
+                media = null; // Free RAM
+            }
+            
+            // 2s delay between images to prevent rate limiting
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+
+    // 2. Send Text
+    if (hasText) {
+        try {
+            await client.sendMessage(groupId, message);
+            console.log('[QUEUE] Text message sent.');
+        } catch (e) {
+            console.error('[QUEUE] Failed to send text:', e.message);
+        }
+    }
+}
+
+
 // --- API ENDPOINTS ---
 
-// 0. Root Health Check
 app.get('/', (req, res) => {
     const uptime = process.uptime();
-    res.send(`Elderly Care Watch AI Bot Server is Running! Uptime: ${Math.floor(uptime)}s`);
+    res.send(`Elderly Care Watch AI Bot Server is Running! Uptime: ${Math.floor(uptime)}s | Queue: ${jobQueue.length}`);
 });
 
-// 1. Check Status & Get QR info
 app.get('/status', (req, res) => {
     res.json({ 
         status: isReady ? 'connected' : 'disconnected',
@@ -137,30 +224,21 @@ app.get('/status', (req, res) => {
     });
 });
 
-// 2. Get QR Code (Raw Data)
 app.get('/qr', (req, res) => {
     res.json({ qr: currentQR });
 });
 
-// 3. Get All Groups (For Admin Discovery)
 app.get('/groups', async (req, res) => {
-    // Return empty array instead of 503 to allow frontend dropdown to render properly (just empty)
     if (!isReady) {
-        console.warn('GET /groups: Client not ready, returning empty list');
         return res.json([]); 
     }
     
     try {
-        console.log('Fetching chats...');
-        
         let attempts = 0;
         let groups = [];
         
-        // Retry logic: WhatsApp Web sometimes takes a moment to sync chats after 'ready'
         while (attempts < 3 && groups.length === 0) {
             const chats = await client.getChats();
-            
-            // Filter for groups: either isGroup property OR id ends with @g.us
             groups = chats
                 .filter(chat => chat.isGroup || chat.id._serialized.endsWith('@g.us'))
                 .map(chat => ({
@@ -169,27 +247,22 @@ app.get('/groups', async (req, res) => {
                 }));
 
             if (groups.length === 0) {
-                console.log(`Attempt ${attempts + 1}: No groups found. Retrying in 2s...`);
                 await new Promise(resolve => setTimeout(resolve, 2000));
                 attempts++;
             } else {
-                break; // Found groups, exit loop
+                break;
             }
         }
-
-        console.log(`Found ${groups.length} groups.`);
         res.json(groups);
     } catch (error) {
         console.error('Error fetching groups:', error);
-        // Return empty array on error to prevent frontend crash
         res.json([]);
     }
 });
 
-// 4. Send Update (Background Processed)
+// The POST endpoint now simply adds to Queue
 app.post('/send-update', (req, res) => {
     if (!isReady) {
-        console.warn('POST /send-update failed: Client not ready');
         return res.status(503).json({ error: 'WhatsApp not connected' });
     }
 
@@ -199,82 +272,20 @@ app.post('/send-update', (req, res) => {
         return res.status(400).json({ error: 'Missing groupId' });
     }
 
-    // Relaxed Validation: Allow empty message IF there are images
+    // Validation
     if ((!message || message.trim() === '') && (!imageUrls || imageUrls.length === 0)) {
         return res.status(400).json({ error: 'At least a message or an image is required' });
     }
 
-    // --- FIRE AND FORGET STRATEGY ---
-    // We reply "Success" immediately so the Frontend doesn't hang or timeout.
-    // The bot processes the images in the background.
+    // Add to Queue
+    jobQueue.push({ groupId, message, imageUrls });
+    console.log(`[API] Job added to queue. Queue length: ${jobQueue.length}`);
+    
+    // Trigger processing if idle
+    processQueue();
+
+    // Reply immediately
     res.json({ success: true, status: 'queued' });
-
-    // Start Background Processing
-    (async () => {
-        console.log(`[BG] Processing update for group: ${groupId}`);
-        const hasImages = imageUrls && imageUrls.length > 0;
-        const hasText = message && message.trim().length > 0;
-
-        try {
-            // 1. Send Images (if any)
-            if (hasImages) {
-                console.log(`[BG] Queued ${imageUrls.length} images...`);
-                
-                // Loop through images
-                for (let i = 0; i < imageUrls.length; i++) {
-                    const url = imageUrls[i];
-                    let media = null; 
-
-                    try {
-                        // Handle Base64 Data URI
-                        if (url.startsWith('data:')) {
-                            const parts = url.split(',');
-                            const mimeMatch = parts[0].match(/:(.*?);/);
-                            const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg'; // Fallback MIME
-                            const data = parts[1];
-                            
-                            // Generate a filename based on timestamp
-                            media = new MessageMedia(mime, data, `update_${Date.now()}_${i}.jpg`);
-                        } else {
-                            // Handle Remote URL
-                            media = await MessageMedia.fromUrl(url);
-                        }
-                        
-                        if (media) {
-                            // Wrap sendMessage in a Promise race to implement timeout
-                            // If sending one image takes > 15 seconds, we skip it
-                            const sendPromise = client.sendMessage(groupId, media);
-                            const timeoutPromise = new Promise((_, reject) => 
-                                setTimeout(() => reject(new Error('Timeout sending image')), 15000)
-                            );
-                            
-                            await Promise.race([sendPromise, timeoutPromise]);
-                            console.log(`[BG] Sent image ${i + 1}/${imageUrls.length}`);
-                        }
-                    } catch (imgErr) {
-                        console.error(`[BG] Failed to process/send image ${i+1}:`, imgErr.message);
-                    } finally {
-                        // MEMORY CLEANUP
-                        media = null;
-                    }
-                    
-                    // SAFETY DELAY: 1s between images to prevent flood limits
-                    await new Promise(r => setTimeout(r, 1000));
-                }
-            }
-
-            // 2. Send Text Message (if any)
-            if (hasText) {
-                await client.sendMessage(groupId, message);
-                console.log('[BG] Text message sent.');
-            }
-
-            console.log('[BG] Batch completed successfully.');
-
-        } catch (error) {
-            console.error('[BG] Critical Background Error:', error);
-        }
-    })();
 });
 
 app.listen(PORT, () => {
