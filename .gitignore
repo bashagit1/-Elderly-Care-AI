@@ -38,3 +38,4 @@ build
 /.cache
 tmp_qr.png
 tmp_qr.svg
+.wwebjs_cache 
