@@ -58,6 +58,14 @@ const jobQueue = [];
 let isProcessingQueue = false;
 let lastJobStartTime = 0; // Timestamp to track stuck jobs
 
+// --- SCHEDULED MAINTENANCE (THE "DEEP" FIX) ---
+// Puppeteer leaks memory over days. We force a clean restart every 24 hours
+// to prevent the "works for 2 days then crashes" issue.
+setInterval(() => {
+    console.log('[MAINTENANCE] Performing daily scheduled restart to clean memory...');
+    process.exit(0); // Railway will restart it fresh
+}, 24 * 60 * 60 * 1000); // 24 Hours
+
 // --- HEARTBEAT & SELF-HEALING (WATCHDOG) ---
 // Monitor not just RAM, but Client State and STUCK QUEUES.
 setInterval(async () => {
@@ -82,13 +90,13 @@ setInterval(async () => {
     if (isReady) {
         try {
             // Ask puppeteer for the state. If this hangs/fails, the browser is dead.
-            const state = await client.getState();
-            if (!state) {
-                console.error('[HEARTBEAT] Client state is null. Restarting...');
-                process.exit(1);
-            }
+            // We race against a timeout because sometimes getState() hangs indefinitely.
+            const statePromise = client.getState();
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
+            
+            await Promise.race([statePromise, timeoutPromise]);
         } catch (e) {
-            console.error('[HEARTBEAT] Client unresponsive. Force Restarting...', e.message);
+            console.error('[HEARTBEAT] Client unresponsive/timeout. Force Restarting...', e.message);
             process.exit(1);
         }
     }
@@ -98,6 +106,7 @@ setInterval(async () => {
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
+        // AGGRESSIVE RESOURCE SAVING ARGS
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox',
@@ -105,9 +114,33 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--disable-extensions', // Save RAM
+            '--disable-component-extensions-with-background-pages',
+            '--disable-default-apps',
+            '--mute-audio', // Don't let browser handle audio
+            '--no-default-browser-check',
+            '--autoplay-policy=user-gesture-required',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-breakpad',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-update',
+            '--disable-features=Translate',
+            '--disable-hang-monitor',
+            '--disable-ipc-flooding-protection',
+            '--disable-popup-blocking',
+            '--disable-prompt-on-repost',
+            '--disable-renderer-backgrounding',
+            '--disable-sync',
+            '--force-color-profile=srgb',
+            '--metrics-recording-only',
+            '--password-store=basic',
+            '--use-mock-keychain'
         ],
-        headless: true 
+        headless: true,
+        // Spoof User Agent to look like a real Windows PC (Prevents WhatsApp disconnects)
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
     }
 });
 
@@ -213,7 +246,8 @@ async function processJob(job) {
             } catch (imgErr) {
                 console.error(`[QUEUE] Error sending image ${i+1}:`, imgErr.message);
             } finally {
-                media = null; // Free RAM
+                media = null; // Free RAM immediately
+                if (global.gc) { global.gc(); } // Hint garbage collector if available
             }
             
             // 2s delay between images to prevent rate limiting
@@ -296,6 +330,7 @@ app.post('/send-update', (req, res) => {
     }
 
     // Validation
+    // ALLOW EMPTY MESSAGE if images exist (As per user request)
     if ((!message || message.trim() === '') && (!imageUrls || imageUrls.length === 0)) {
         return res.status(400).json({ error: 'At least a message or an image is required' });
     }
