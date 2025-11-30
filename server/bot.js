@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
  */
 
 // --- DEPENDENCY CHECK ---
-let Client, LocalAuth, MessageMedia, qrcode, express, cors, dotenv;
+let Client, LocalAuth, MessageMedia, qrcode, express, cors, dotenv, createClient;
 
 try {
     const ww = require('whatsapp-web.js');
@@ -21,6 +21,8 @@ try {
     express = require('express');
     cors = require('cors');
     dotenv = require('dotenv');
+    const supabasePkg = require('@supabase/supabase-js');
+    createClient = supabasePkg.createClient;
 } catch (e) {
     console.error('\n\n❌ ERROR: MISSING DEPENDENCIES ❌');
     console.error('-----------------------------------');
@@ -49,6 +51,17 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 3001;
 
+// --- SUPABASE MAINTENANCE SETUP ---
+// Using hardcoded fallbacks to ensure cleanup works even if ENV vars are missing on Railway
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://zaiektkvhjfndfebolao.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InphaWVrdGt2aGpmbmRmZWJvbGFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM3OTM3NTEsImV4cCI6MjA3OTM2OTc1MX0.34BB18goOvIpwPci2u25JLoC7l9PRfanpC9C4DS4RfQ';
+
+let supabase = null;
+if (createClient) {
+    supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    console.log('✅ Supabase connected for maintenance tasks');
+}
+
 // --- GLOBAL STATE & QUEUE ---
 let isReady = false;
 let currentQR = null;
@@ -59,12 +72,37 @@ let isProcessingQueue = false;
 let lastJobStartTime = 0; // Timestamp to track stuck jobs
 
 // --- SCHEDULED MAINTENANCE (THE "DEEP" FIX) ---
-// Puppeteer leaks memory over days. We force a clean restart every 24 hours
-// to prevent the "works for 2 days then crashes" issue.
+// 1. Puppeteer Memory Cleanup (Every 24 Hours)
 setInterval(() => {
     console.log('[MAINTENANCE] Performing daily scheduled restart to clean memory...');
     process.exit(0); // Railway will restart it fresh
-}, 24 * 60 * 60 * 1000); // 24 Hours
+}, 24 * 60 * 60 * 1000); 
+
+// 2. Database Image Cleanup (Every 1 Hour)
+// Deletes images older than 15 hours to prevent database bloat/timeouts
+setInterval(async () => {
+    if (!supabase) return;
+
+    console.log('[MAINTENANCE] Running 15-Hour Image Cleanup...');
+    const timeLimit = new Date(Date.now() - 15 * 60 * 60 * 1000).toISOString();
+
+    try {
+        // Clear image_urls for logs older than 15 hours
+        const { error } = await supabase
+            .from('activity_logs')
+            .update({ image_urls: [] })
+            .lt('created_at', timeLimit);
+        
+        if (error) {
+            console.error('[CLEANUP] Error:', error.message);
+        } else {
+            console.log('[CLEANUP] Old images removed to save database space.');
+        }
+    } catch (err) {
+        console.error('[CLEANUP] Failed:', err.message);
+    }
+}, 60 * 60 * 1000);
+
 
 // --- HEARTBEAT & SELF-HEALING (WATCHDOG) ---
 // Monitor not just RAM, but Client State and STUCK QUEUES.
