@@ -37,6 +37,7 @@ try {
 dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 3001;
 
 // Robust CORS to allow Netlify frontend
 app.use(cors({
@@ -49,10 +50,14 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-const PORT = process.env.PORT || 3001;
+// --- IMMEDIATE SERVER START ---
+// We start the web server immediately so the frontend knows we are "Online"
+// even if WhatsApp takes a while to initialize.
+app.listen(PORT, () => {
+    console.log(`✅ AI Agent Server running immediately on port ${PORT}`);
+});
 
 // --- SUPABASE MAINTENANCE SETUP ---
-// Using hardcoded fallbacks to ensure cleanup works even if ENV vars are missing on Railway
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://zaiektkvhjfndfebolao.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InphaWVrdGt2aGpmbmRmZWJvbGFvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM3OTM3NTEsImV4cCI6MjA3OTM2OTc1MX0.34BB18goOvIpwPci2u25JLoC7l9PRfanpC9C4DS4RfQ';
 
@@ -63,6 +68,7 @@ if (createClient) {
 }
 
 // --- GLOBAL STATE & QUEUE ---
+let client = null; // Defined globally
 let isReady = false;
 let currentQR = null;
 
@@ -79,7 +85,6 @@ setInterval(() => {
 }, 24 * 60 * 60 * 1000); 
 
 // 2. Database Image Cleanup (Every 1 Hour)
-// Deletes images older than 15 hours to prevent database bloat/timeouts
 setInterval(async () => {
     if (!supabase) return;
 
@@ -87,7 +92,6 @@ setInterval(async () => {
     const timeLimit = new Date(Date.now() - 15 * 60 * 60 * 1000).toISOString();
 
     try {
-        // Clear image_urls for logs older than 15 hours
         const { error } = await supabase
             .from('activity_logs')
             .update({ image_urls: [] })
@@ -105,7 +109,6 @@ setInterval(async () => {
 
 
 // --- HEARTBEAT & SELF-HEALING (WATCHDOG) ---
-// Monitor not just RAM, but Client State and STUCK QUEUES.
 setInterval(async () => {
     const memUsage = process.memoryUsage();
     const ram = Math.round(memUsage.heapUsed / 1024 / 1024);
@@ -114,24 +117,20 @@ setInterval(async () => {
     console.log(`[HEARTBEAT] Uptime: ${uptime}s | RAM: ${ram}MB | Queue: ${jobQueue.length} | Ready: ${isReady}`);
 
     // WATCHDOG: Check for STUCK JOBS
-    // If we are "processing" a job for more than 2 minutes (120000ms), the browser is frozen.
     if (isProcessingQueue && lastJobStartTime > 0) {
         const duration = Date.now() - lastJobStartTime;
         if (duration > 120000) { 
             console.error(`[WATCHDOG] 🚨 CRITICAL: Job stuck for ${Math.round(duration/1000)}s. Browser likely frozen.`);
             console.error('[WATCHDOG] Force restarting server to clear fault...');
-            process.exit(1); // Railway will restart the container fresh
+            process.exit(1); 
         }
     }
 
     // Active Health Check
-    if (isReady) {
+    if (isReady && client) {
         try {
-            // Ask puppeteer for the state. If this hangs/fails, the browser is dead.
-            // We race against a timeout because sometimes getState() hangs indefinitely.
             const statePromise = client.getState();
             const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
-            
             await Promise.race([statePromise, timeoutPromise]);
         } catch (e) {
             console.error('[HEARTBEAT] Client unresponsive/timeout. Force Restarting...', e.message);
@@ -140,100 +139,96 @@ setInterval(async () => {
     }
 }, 60000); // Check every 60 seconds
 
-// Initialize WhatsApp Client
-const client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-        // AGGRESSIVE RESOURCE SAVING ARGS
-        args: [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Critical for Docker/Railway
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu',
-            '--disable-extensions', // Save RAM
-            '--disable-component-extensions-with-background-pages',
-            '--disable-default-apps',
-            '--mute-audio', // Don't let browser handle audio
-            '--no-default-browser-check',
-            '--autoplay-policy=user-gesture-required',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-breakpad',
-            '--disable-client-side-phishing-detection',
-            '--disable-component-update',
-            '--disable-features=Translate',
-            '--disable-hang-monitor',
-            '--disable-ipc-flooding-protection',
-            '--disable-popup-blocking',
-            '--disable-prompt-on-repost',
-            '--disable-renderer-backgrounding',
-            '--disable-sync',
-            '--force-color-profile=srgb',
-            '--metrics-recording-only',
-            '--password-store=basic',
-            '--use-mock-keychain'
-        ],
-        headless: true,
-        // Spoof User Agent to look like a real Windows PC (Prevents WhatsApp disconnects)
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
+// --- INITIALIZATION LOOP ---
+async function startWhatsApp() {
+    console.log('Initializing WhatsApp Client...');
+    
+    try {
+        client = new Client({
+            authStrategy: new LocalAuth(),
+            puppeteer: {
+                args: [
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                    '--disable-extensions',
+                    '--mute-audio',
+                    '--no-default-browser-check',
+                    '--disable-features=Translate',
+                    '--force-color-profile=srgb',
+                    '--metrics-recording-only'
+                ],
+                headless: true,
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
+            }
+        });
+
+        client.on('qr', (qr) => {
+            currentQR = qr;
+            isReady = false;
+            console.log('QR RECEIVED. Scan this to login.');
+            qrcode.generate(qr, { small: true });
+        });
+
+        client.on('ready', () => {
+            console.log('✅ Client is ready!');
+            isReady = true;
+            currentQR = null;
+        });
+
+        client.on('authenticated', () => {
+            console.log('✅ AUTHENTICATED');
+            isReady = true;
+            currentQR = null;
+        });
+
+        client.on('auth_failure', (msg) => {
+            console.error('❌ AUTHENTICATION FAILURE', msg);
+            isReady = false;
+            // Fatal error, we should probably restart
+            process.exit(1);
+        });
+
+        client.on('disconnected', (reason) => {
+            console.log('⚠️ Client was logged out:', reason);
+            isReady = false;
+            console.log('RESTARTING SERVER TO REFRESH SESSION...');
+            process.exit(1); 
+        });
+
+        await client.initialize();
+        
+    } catch (err) {
+        console.error("Client initialization failed. Retrying in 10 seconds...", err);
+        isReady = false;
+        // Retry logic instead of hard crash
+        setTimeout(startWhatsApp, 10000);
     }
-});
-
-client.on('qr', (qr) => {
-    currentQR = qr;
-    isReady = false;
-    console.log('QR RECEIVED. Scan this to login.');
-    qrcode.generate(qr, { small: true });
-});
-
-client.on('ready', () => {
-    console.log('✅ Client is ready!');
-    isReady = true;
-    currentQR = null;
-});
-
-client.on('authenticated', () => {
-    console.log('✅ AUTHENTICATED');
-    isReady = true;
-    currentQR = null;
-});
-
-client.on('auth_failure', (msg) => {
-    console.error('❌ AUTHENTICATION FAILURE', msg);
-    isReady = false;
-    process.exit(1);
-});
-
-client.on('disconnected', (reason) => {
-    console.log('⚠️ Client was logged out:', reason);
-    isReady = false;
-    console.log('RESTARTING SERVER TO REFRESH SESSION...');
-    process.exit(1); 
-});
-
-// Initialize client
-console.log('Initializing WhatsApp Client...');
-try {
-    client.initialize().catch(err => {
-        console.error("Client initialization failed:", err);
-        process.exit(1);
-    });
-} catch (err) {
-    console.error("Synchronous client error:", err);
-    process.exit(1);
 }
+
+// Start the loop
+startWhatsApp();
+
 
 // --- QUEUE PROCESSOR ---
 async function processQueue() {
     if (isProcessingQueue || jobQueue.length === 0) return;
 
+    // Safety check
+    if (!client) {
+        console.warn('[QUEUE] Client not defined yet. Waiting...');
+        setTimeout(processQueue, 2000);
+        return;
+    }
+
     isProcessingQueue = true;
-    lastJobStartTime = Date.now(); // Mark start time for Watchdog
+    lastJobStartTime = Date.now(); 
     
-    const job = jobQueue.shift(); // Get the oldest job
+    const job = jobQueue.shift(); 
 
     console.log(`[QUEUE] Processing job for Group ${job.groupId} (${job.imageUrls?.length || 0} images)`);
 
@@ -243,8 +238,7 @@ async function processQueue() {
         console.error(`[QUEUE] Job Failed:`, err);
     } finally {
         isProcessingQueue = false;
-        lastJobStartTime = 0; // Reset watchdog timer
-        // Wait a small bit before next job to let CPU cool down
+        lastJobStartTime = 0; 
         setTimeout(processQueue, 1000); 
     }
 }
@@ -273,7 +267,6 @@ async function processJob(job) {
                 
                 if (media) {
                     const sendPromise = client.sendMessage(groupId, media);
-                    // 20s Timeout per image (increased for safety)
                     const timeoutPromise = new Promise((_, reject) => 
                         setTimeout(() => reject(new Error('Timeout sending image')), 20000)
                     );
@@ -284,11 +277,10 @@ async function processJob(job) {
             } catch (imgErr) {
                 console.error(`[QUEUE] Error sending image ${i+1}:`, imgErr.message);
             } finally {
-                media = null; // Free RAM immediately
-                if (global.gc) { global.gc(); } // Hint garbage collector if available
+                media = null; 
+                if (global.gc) { global.gc(); } 
             }
             
-            // 2s delay between images to prevent rate limiting
             await new Promise(r => setTimeout(r, 2000));
         }
     }
@@ -324,7 +316,7 @@ app.get('/qr', (req, res) => {
 });
 
 app.get('/groups', async (req, res) => {
-    if (!isReady) {
+    if (!isReady || !client) {
         return res.json([]); 
     }
     
@@ -355,8 +347,9 @@ app.get('/groups', async (req, res) => {
     }
 });
 
-// The POST endpoint now simply adds to Queue
 app.post('/send-update', (req, res) => {
+    // If client is initializing, we might still want to queue the job?
+    // But safest is to say 503 if not ready.
     if (!isReady) {
         return res.status(503).json({ error: 'WhatsApp not connected' });
     }
@@ -367,23 +360,14 @@ app.post('/send-update', (req, res) => {
         return res.status(400).json({ error: 'Missing groupId' });
     }
 
-    // Validation
-    // ALLOW EMPTY MESSAGE if images exist (As per user request)
     if ((!message || message.trim() === '') && (!imageUrls || imageUrls.length === 0)) {
         return res.status(400).json({ error: 'At least a message or an image is required' });
     }
 
-    // Add to Queue
     jobQueue.push({ groupId, message, imageUrls });
     console.log(`[API] Job added to queue. Queue length: ${jobQueue.length}`);
     
-    // Trigger processing if idle
     processQueue();
 
-    // Reply immediately
     res.json({ success: true, status: 'queued' });
-});
-
-app.listen(PORT, () => {
-    console.log(`AI Agent Server running on port ${PORT}`);
 });
