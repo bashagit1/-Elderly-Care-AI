@@ -78,15 +78,17 @@ let isProcessingQueue = false;
 let lastJobStartTime = 0; // Timestamp to track stuck jobs
 
 // --- SCHEDULED MAINTENANCE (THE "DEEP" FIX) ---
-// 1. Puppeteer Memory Cleanup (Every 24 Hours)
-setInterval(() => {
-    console.log('[MAINTENANCE] Performing daily scheduled restart to clean memory...');
-    process.exit(0); // Railway will restart it fresh
-}, 24 * 60 * 60 * 1000); 
 
-// 2. Database Image Cleanup (Every 1 Hour)
+// 1. Database Image Cleanup (Every 1 Hour)
 setInterval(async () => {
     if (!supabase) return;
+
+    // Trigger Garbage Collection if exposed (via --expose-gc)
+    // This cleans up memory WITHOUT restarting the server
+    if (global.gc) {
+        console.log('[MAINTENANCE] Running Garbage Collection...');
+        global.gc();
+    }
 
     console.log('[MAINTENANCE] Running 15-Hour Image Cleanup...');
     const timeLimit = new Date(Date.now() - 15 * 60 * 60 * 1000).toISOString();
@@ -108,6 +110,21 @@ setInterval(async () => {
 }, 60 * 60 * 1000);
 
 
+// 2. Keep-Alive Ping (Every 4 Hours)
+// This prevents WhatsApp from marking the session as inactive
+setInterval(async () => {
+    if (isReady && client) {
+        console.log('[MAINTENANCE] Sending Keep-Alive Ping...');
+        try {
+            // Just getting the state keeps the socket active
+            await client.getState(); 
+        } catch (e) {
+            console.warn('[MAINTENANCE] Keep-Alive failed:', e.message);
+        }
+    }
+}, 4 * 60 * 60 * 1000);
+
+
 // --- HEARTBEAT & SELF-HEALING (WATCHDOG) ---
 setInterval(async () => {
     const memUsage = process.memoryUsage();
@@ -119,7 +136,7 @@ setInterval(async () => {
     // WATCHDOG: Check for STUCK JOBS
     if (isProcessingQueue && lastJobStartTime > 0) {
         const duration = Date.now() - lastJobStartTime;
-        if (duration > 120000) { 
+        if (duration > 180000) { // Increased to 3 minutes
             console.error(`[WATCHDOG] 🚨 CRITICAL: Job stuck for ${Math.round(duration/1000)}s. Browser likely frozen.`);
             console.error('[WATCHDOG] Force restarting server to clear fault...');
             process.exit(1); 
@@ -130,7 +147,7 @@ setInterval(async () => {
     if (isReady && client) {
         try {
             const statePromise = client.getState();
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000));
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000));
             await Promise.race([statePromise, timeoutPromise]);
         } catch (e) {
             console.error('[HEARTBEAT] Client unresponsive/timeout. Force Restarting...', e.message);
@@ -145,7 +162,7 @@ async function startWhatsApp() {
     
     try {
         client = new Client({
-            authStrategy: new LocalAuth(),
+            authStrategy: new LocalAuth(), // LocalAuth saves session to ./wwebjs_auth
             puppeteer: {
                 args: [
                     '--no-sandbox', 
@@ -163,7 +180,8 @@ async function startWhatsApp() {
                     '--metrics-recording-only'
                 ],
                 headless: true,
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
+                // Using a standard User Agent helps prevent "soft bans" or disconnects
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
             }
         });
 
@@ -239,6 +257,10 @@ async function processQueue() {
     } finally {
         isProcessingQueue = false;
         lastJobStartTime = 0; 
+        
+        // Force GC after heavy job
+        if (global.gc) { global.gc(); }
+
         setTimeout(processQueue, 1000); 
     }
 }
@@ -278,7 +300,6 @@ async function processJob(job) {
                 console.error(`[QUEUE] Error sending image ${i+1}:`, imgErr.message);
             } finally {
                 media = null; 
-                if (global.gc) { global.gc(); } 
             }
             
             await new Promise(r => setTimeout(r, 2000));
